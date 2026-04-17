@@ -1,0 +1,39 @@
+From 96d29072f469398240a18a6520a615ce8d1c4b82 Mon Sep 17 00:00:00 2001
+From: Ivan Khokhlov <ivan.s.khokhlov@rt.ru>
+Date: Fri, 17 Apr 2026 00:24:25 +0400
+Subject: [PATCH 2/2] winemac: attach detached OpenGL views immediately
+
+Detached offscreen views do not go through the normal needsUpdate flow
+used by window-backed views. Avoid deferring them through latentView and
+attach them to the NSOpenGLContext immediately when making the context
+current.
+
+This keeps the offscreen pbuffer fallback drawing into the expected
+drawable instead of inheriting stale drawable state.
+---
+ dlls/winemac.drv/cocoa_opengl.m | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winemac.drv/cocoa_opengl.m b/dlls/winemac.drv/cocoa_opengl.m
+index 2801834..fbafc43 100644
+--- a/dlls/winemac.drv/cocoa_opengl.m
++++ b/dlls/winemac.drv/cocoa_opengl.m
+@@ -238,6 +238,7 @@ void macdrv_make_context_current(macdrv_opengl_context c, macdrv_view v, CGRect
+ {
+     WineOpenGLContext *context = (WineOpenGLContext*)c;
+     NSView* view = (NSView*)v;
++    BOOL offscreen_view = view && ![view window];
+ 
+     if (context && view)
+     {
+@@ -251,7 +252,7 @@ void macdrv_make_context_current(macdrv_opengl_context c, macdrv_view v, CGRect
+             [context removeFromViews:NO];
+             macdrv_add_view_opengl_context(v, c);
+ 
+-            if (context.needsUpdate)
++            if (context.needsUpdate || offscreen_view)
+             {
+                 context.needsUpdate = FALSE;
+                 context.needsReattach = FALSE;
+-- 
+2.53.0

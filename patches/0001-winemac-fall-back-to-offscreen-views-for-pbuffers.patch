@@ -1,0 +1,527 @@
+From 64bb9b06fa7ee463aae6cd192dc3056ecf031f87 Mon Sep 17 00:00:00 2001
+From: Ivan Khokhlov <ivan.s.khokhlov@rt.ru>
+Date: Fri, 17 Apr 2026 00:24:18 +0400
+Subject: [PATCH 1/2] winemac: fall back to offscreen views for pbuffers
+
+Keep using real CGL pbuffers when they can be created, but fall back
+to an NSView-backed offscreen drawable when CGLCreatePBuffer() fails.
+
+Teach the render-to-texture fallback path to redirect glCopyTexImage2D
+and glCopyTexSubImage2D through readback and upload when the drawable is
+view-backed, and preserve viewport/scissor state while switching into
+the emulated drawable.
+
+Observed while debugging World of Warcraft 3.3.5a indoor minimap
+rendering on Apple Silicon macOS.
+---
+ dlls/winemac.drv/opengl.c | 354 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 349 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index 0af1d3f..09d386f 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -40,6 +40,7 @@
+ #include <OpenGL/glu.h>
+ #include <OpenGL/CGLRenderers.h>
+ #include <dlfcn.h>
++#include <stdlib.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wgl);
+ 
+@@ -62,12 +63,22 @@ struct macdrv_context
+     CGLContextObj           cglcontext;
+     HWND                    draw_hwnd;
+     macdrv_view             draw_view;
++    RECT                    draw_view_rect;
+     CGLPBufferObj           draw_pbuffer;
++    BOOL                    draw_emulated_pbuffer;
+     GLenum                  draw_pbuffer_face;
+     GLint                   draw_pbuffer_level;
+     HWND                    read_hwnd;
+     macdrv_view             read_view;
++    RECT                    read_view_rect;
+     CGLPBufferObj           read_pbuffer;
++    BOOL                    read_emulated_pbuffer;
++    GLenum                  emulated_pbuffer_source;
++    BOOL                    current_emulated_pbuffer;
++    BOOL                    saved_emulated_state_valid;
++    GLint                   saved_viewport[4];
++    GLint                   saved_scissor_box[4];
++    GLboolean               saved_scissor_test;
+     int                     swap_interval;
+ };
+ 
+@@ -75,6 +86,9 @@ struct gl_drawable
+ {
+     struct opengl_drawable  base;
+     CGLPBufferObj           pbuffer;
++    macdrv_view             emulated_view;
++    RECT                    emulated_rect;
++    BOOL                    emulated_pbuffer;
+ };
+ 
+ static struct gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
+@@ -91,10 +105,43 @@ static const struct opengl_drawable_funcs macdrv_pbuffer_funcs;
+ static void (*pglCopyColorTable)(GLenum target, GLenum internalformat, GLint x, GLint y,
+                                  GLsizei width);
+ static void (*pglCopyPixels)(GLint x, GLint y, GLsizei width, GLsizei height, GLenum type);
++static void (*pglCopyTexImage2D)(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y,
++                                 GLsizei width, GLsizei height, GLint border);
++static void (*pglCopyTexSubImage2D)(GLenum target, GLint level, GLint xoffset, GLint yoffset,
++                                    GLint x, GLint y, GLsizei width, GLsizei height);
++static void (*pglGetBooleanv)(GLenum pname, GLboolean *data);
+ static const GLubyte *(*pglGetString)(GLenum name);
+ static PFN_glGetIntegerv pglGetIntegerv;
+ static void (*pglReadPixels)(GLint x, GLint y, GLsizei width, GLsizei height,
+                              GLenum format, GLenum type, void *pixels);
++static void (*pglScissor)(GLint x, GLint y, GLsizei width, GLsizei height);
++static void (*pglTexImage2D)(GLenum target, GLint level, GLint internalformat, GLsizei width,
++                             GLsizei height, GLint border, GLenum format, GLenum type,
++                             const void *pixels);
++static void (*pglTexSubImage2D)(GLenum target, GLint level, GLint xoffset, GLint yoffset,
++                                GLsizei width, GLsizei height, GLenum format, GLenum type,
++                                const void *pixels);
++static void (*pglPixelStorei)(GLenum pname, GLint param);
++static void (*pglViewport)(GLint x, GLint y, GLsizei width, GLsizei height);
++
++static void convert_bgra_to_rgba_opaque(unsigned char *pixels, GLsizei width, GLsizei height)
++{
++    size_t total_pixels = (size_t)max(width, 1) * max(height, 1);
++    size_t i;
++
++    if (!pixels) return;
++
++    for (i = 0; i < total_pixels; ++i)
++    {
++        unsigned char *pixel = pixels + i * 4;
++        unsigned char blue = pixel[0];
++        unsigned char red = pixel[2];
++
++        pixel[0] = red;
++        pixel[2] = blue;
++        pixel[3] = 0xff;
++    }
++}
+ 
+ 
+ struct color_mode {
+@@ -1492,20 +1539,28 @@ static void macdrv_surface_destroy(struct opengl_drawable *base)
+ static void make_context_current(struct macdrv_context *context, BOOL read)
+ {
+     macdrv_view view;
+-    RECT view_rect;
++    RECT view_rect = {0};
+     CGLPBufferObj pbuffer;
++    BOOL emulated_pbuffer;
++    GLsizei drawable_width;
++    GLsizei drawable_height;
++    BOOL was_emulated = context->current_emulated_pbuffer;
+ 
+     if (read)
+     {
+         if (context->read_hwnd) NtUserGetClientRect(context->read_hwnd, &view_rect, NtUserGetDpiForWindow(context->read_hwnd));
++        else view_rect = context->read_view_rect;
+         view = context->read_view;
+         pbuffer = context->read_pbuffer;
++        emulated_pbuffer = context->read_emulated_pbuffer;
+     }
+     else
+     {
+         if (context->draw_hwnd) NtUserGetClientRect(context->draw_hwnd, &view_rect, NtUserGetDpiForWindow(context->draw_hwnd));
++        else view_rect = context->draw_view_rect;
+         view = context->draw_view;
+         pbuffer = context->draw_pbuffer;
++        emulated_pbuffer = context->draw_emulated_pbuffer;
+     }
+ 
+     if (view || !pbuffer)
+@@ -1519,6 +1574,42 @@ static void make_context_current(struct macdrv_context *context, BOOL read)
+         CGLSetPBuffer(context->cglcontext, pbuffer, context->draw_pbuffer_face, context->draw_pbuffer_level, 0);
+         CGLSetCurrentContext(context->cglcontext);
+     }
++
++    if (emulated_pbuffer)
++    {
++        drawable_width = max(view_rect.right - view_rect.left, 1);
++        drawable_height = max(view_rect.bottom - view_rect.top, 1);
++
++        if (!was_emulated)
++        {
++            pglGetIntegerv(GL_VIEWPORT, context->saved_viewport);
++            pglGetIntegerv(GL_SCISSOR_BOX, context->saved_scissor_box);
++            pglGetBooleanv(GL_SCISSOR_TEST, &context->saved_scissor_test);
++            context->saved_emulated_state_valid = TRUE;
++        }
++
++        pglViewport(0, 0, drawable_width, drawable_height);
++        if (context->saved_scissor_test)
++            pglScissor(0, 0, drawable_width, drawable_height);
++    }
++    else if (was_emulated && context->saved_emulated_state_valid)
++    {
++        pglViewport(context->saved_viewport[0], context->saved_viewport[1],
++                    context->saved_viewport[2], context->saved_viewport[3]);
++        if (context->saved_scissor_test)
++        {
++            funcs->p_glEnable(GL_SCISSOR_TEST);
++            pglScissor(context->saved_scissor_box[0], context->saved_scissor_box[1],
++                       context->saved_scissor_box[2], context->saved_scissor_box[3]);
++        }
++        else
++        {
++            funcs->p_glDisable(GL_SCISSOR_TEST);
++        }
++        context->saved_emulated_state_valid = FALSE;
++    }
++
++    context->current_emulated_pbuffer = emulated_pbuffer;
+ }
+ 
+ 
+@@ -2070,6 +2161,174 @@ static void macdrv_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,
+ }
+ 
+ 
++/**********************************************************************
++ *              macdrv_glCopyTexImage2D
++ *
++ * Emulate texture copies for NSView-backed pbuffer fallbacks by reading
++ * back the current surface contents and uploading them into the destination
++ * texture. This preserves the existing read/draw separation handling used
++ * by the rest of the driver.
++ */
++static void macdrv_glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat,
++                                    GLint x, GLint y, GLsizei width, GLsizei height,
++                                    GLint border)
++{
++    struct macdrv_context *context = NtCurrentTeb()->glReserved2;
++    BOOL separate_readable = context && (context->read_view || context->read_pbuffer);
++    BOOL emulated_pbuffer = context && (context->draw_emulated_pbuffer || context->read_emulated_pbuffer);
++    GLenum desired_read_buffer = GL_FRONT;
++    GLint prev_read_buffer = 0;
++    GLint prev_pack_row_length = 0, prev_pack_skip_rows = 0, prev_pack_skip_pixels = 0, prev_pack_alignment = 0;
++    GLint prev_unpack_row_length = 0, prev_unpack_skip_rows = 0, prev_unpack_skip_pixels = 0, prev_unpack_alignment = 0;
++    unsigned char *pixels = NULL;
++
++    if ((separate_readable || emulated_pbuffer) && !internalformat)
++        internalformat = GL_RGBA;
++
++    if (separate_readable)
++        make_context_current(context, TRUE);
++
++    if (emulated_pbuffer)
++    {
++        if (context->emulated_pbuffer_source != GL_NONE)
++            desired_read_buffer = context->emulated_pbuffer_source;
++
++        pglGetIntegerv(GL_READ_BUFFER, &prev_read_buffer);
++        funcs->p_glFlush();
++        funcs->p_glReadBuffer(desired_read_buffer);
++
++        if ((pixels = malloc((size_t)max(width, 1) * max(height, 1) * 4)))
++        {
++            pglGetIntegerv(GL_PACK_ROW_LENGTH, &prev_pack_row_length);
++            pglGetIntegerv(GL_PACK_SKIP_ROWS, &prev_pack_skip_rows);
++            pglGetIntegerv(GL_PACK_SKIP_PIXELS, &prev_pack_skip_pixels);
++            pglGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack_alignment);
++            pglGetIntegerv(GL_UNPACK_ROW_LENGTH, &prev_unpack_row_length);
++            pglGetIntegerv(GL_UNPACK_SKIP_ROWS, &prev_unpack_skip_rows);
++            pglGetIntegerv(GL_UNPACK_SKIP_PIXELS, &prev_unpack_skip_pixels);
++            pglGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_unpack_alignment);
++
++            pglPixelStorei(GL_PACK_ROW_LENGTH, 0);
++            pglPixelStorei(GL_PACK_SKIP_ROWS, 0);
++            pglPixelStorei(GL_PACK_SKIP_PIXELS, 0);
++            pglPixelStorei(GL_PACK_ALIGNMENT, 4);
++            pglPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++            pglPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++            pglPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++            pglPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++
++            pglReadPixels(x, y, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
++            convert_bgra_to_rgba_opaque(pixels, width, height);
++            pglTexImage2D(target, level, internalformat, width, height, border,
++                          GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++
++            pglPixelStorei(GL_PACK_ROW_LENGTH, prev_pack_row_length);
++            pglPixelStorei(GL_PACK_SKIP_ROWS, prev_pack_skip_rows);
++            pglPixelStorei(GL_PACK_SKIP_PIXELS, prev_pack_skip_pixels);
++            pglPixelStorei(GL_PACK_ALIGNMENT, prev_pack_alignment);
++            pglPixelStorei(GL_UNPACK_ROW_LENGTH, prev_unpack_row_length);
++            pglPixelStorei(GL_UNPACK_SKIP_ROWS, prev_unpack_skip_rows);
++            pglPixelStorei(GL_UNPACK_SKIP_PIXELS, prev_unpack_skip_pixels);
++            pglPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack_alignment);
++            free(pixels);
++            funcs->p_glReadBuffer(prev_read_buffer);
++
++            if (separate_readable)
++                make_context_current(context, FALSE);
++            return;
++        }
++
++        funcs->p_glReadBuffer(prev_read_buffer);
++        WARN("failed to allocate emulated pbuffer copy buffer for glCopyTexImage2D\n");
++    }
++
++    pglCopyTexImage2D(target, level, internalformat, x, y, width, height, border);
++
++    if (separate_readable)
++        make_context_current(context, FALSE);
++}
++
++
++/**********************************************************************
++ *              macdrv_glCopyTexSubImage2D
++ */
++static void macdrv_glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset,
++                                       GLint yoffset, GLint x, GLint y,
++                                       GLsizei width, GLsizei height)
++{
++    struct macdrv_context *context = NtCurrentTeb()->glReserved2;
++    BOOL separate_readable = context && (context->read_view || context->read_pbuffer);
++    BOOL emulated_pbuffer = context && (context->draw_emulated_pbuffer || context->read_emulated_pbuffer);
++    GLenum desired_read_buffer = GL_FRONT;
++    GLint prev_read_buffer = 0;
++    GLint prev_pack_row_length = 0, prev_pack_skip_rows = 0, prev_pack_skip_pixels = 0, prev_pack_alignment = 0;
++    GLint prev_unpack_row_length = 0, prev_unpack_skip_rows = 0, prev_unpack_skip_pixels = 0, prev_unpack_alignment = 0;
++    unsigned char *pixels = NULL;
++
++    if (separate_readable)
++        make_context_current(context, TRUE);
++
++    if (emulated_pbuffer)
++    {
++        if (context->emulated_pbuffer_source != GL_NONE)
++            desired_read_buffer = context->emulated_pbuffer_source;
++
++        pglGetIntegerv(GL_READ_BUFFER, &prev_read_buffer);
++        funcs->p_glFlush();
++        funcs->p_glReadBuffer(desired_read_buffer);
++
++        if ((pixels = malloc((size_t)max(width, 1) * max(height, 1) * 4)))
++        {
++            pglGetIntegerv(GL_PACK_ROW_LENGTH, &prev_pack_row_length);
++            pglGetIntegerv(GL_PACK_SKIP_ROWS, &prev_pack_skip_rows);
++            pglGetIntegerv(GL_PACK_SKIP_PIXELS, &prev_pack_skip_pixels);
++            pglGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack_alignment);
++            pglGetIntegerv(GL_UNPACK_ROW_LENGTH, &prev_unpack_row_length);
++            pglGetIntegerv(GL_UNPACK_SKIP_ROWS, &prev_unpack_skip_rows);
++            pglGetIntegerv(GL_UNPACK_SKIP_PIXELS, &prev_unpack_skip_pixels);
++            pglGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_unpack_alignment);
++
++            pglPixelStorei(GL_PACK_ROW_LENGTH, 0);
++            pglPixelStorei(GL_PACK_SKIP_ROWS, 0);
++            pglPixelStorei(GL_PACK_SKIP_PIXELS, 0);
++            pglPixelStorei(GL_PACK_ALIGNMENT, 4);
++            pglPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++            pglPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++            pglPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++            pglPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++
++            pglReadPixels(x, y, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
++            convert_bgra_to_rgba_opaque(pixels, width, height);
++            pglTexSubImage2D(target, level, xoffset, yoffset, width, height,
++                             GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++
++            pglPixelStorei(GL_PACK_ROW_LENGTH, prev_pack_row_length);
++            pglPixelStorei(GL_PACK_SKIP_ROWS, prev_pack_skip_rows);
++            pglPixelStorei(GL_PACK_SKIP_PIXELS, prev_pack_skip_pixels);
++            pglPixelStorei(GL_PACK_ALIGNMENT, prev_pack_alignment);
++            pglPixelStorei(GL_UNPACK_ROW_LENGTH, prev_unpack_row_length);
++            pglPixelStorei(GL_UNPACK_SKIP_ROWS, prev_unpack_skip_rows);
++            pglPixelStorei(GL_UNPACK_SKIP_PIXELS, prev_unpack_skip_pixels);
++            pglPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack_alignment);
++            free(pixels);
++            funcs->p_glReadBuffer(prev_read_buffer);
++
++            if (separate_readable)
++                make_context_current(context, FALSE);
++            return;
++        }
++
++        funcs->p_glReadBuffer(prev_read_buffer);
++        WARN("failed to allocate emulated pbuffer copy buffer for glCopyTexSubImage2D\n");
++    }
++
++    pglCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
++
++    if (separate_readable)
++        make_context_current(context, FALSE);
++}
++
++
+ /***********************************************************************
+  *              macdrv_wglBindTexImageARB
+  *
+@@ -2084,6 +2343,23 @@ static UINT macdrv_pbuffer_bind(HDC hdc, struct opengl_drawable *base, GLenum so
+ 
+     TRACE("hdc %p drawable %s source 0x%x\n", hdc, debugstr_opengl_drawable(base), source);
+ 
++    if (gl->emulated_pbuffer)
++    {
++        if (context) context->emulated_pbuffer_source = source;
++
++        /* win32u falls back to glCopyTexImage2D/glCopyTexSubImage2D when -1 is returned.
++         * Redirect those entry points so the fallback can read back the NSView-backed
++         * offscreen surface instead of calling CGLTexImagePBuffer(). */
++        if (context && source != GL_NONE)
++        {
++            funcs->p_glFlush();
++            err = CGLFlushDrawable(context->cglcontext);
++            if (err != kCGLNoError)
++                WARN("CGLFlushDrawable failed with err %d %s\n", err, CGLErrorString(err));
++        }
++        return -1;
++    }
++
+     if (!context->draw_view && context->draw_pbuffer == pbuffer && source != GL_NONE)
+         funcs->p_glFlush();
+ 
+@@ -2223,7 +2499,23 @@ static BOOL macdrv_pbuffer_create(HDC hdc, int format, BOOL largest, GLenum text
+                                   GLint max_level, GLsizei *width, GLsizei *height, struct opengl_drawable **drawable)
+ {
+     struct gl_drawable *gl;
++    RECT emulated_rect;
+     CGLError err;
++    const GLenum original_texture_format = texture_format;
++    const GLenum original_texture_target = texture_target;
++    unsigned int i;
++    const struct
++    {
++        GLenum target;
++        GLenum format;
++        const char *label;
++    } attempts[] =
++    {
++        { GL_TEXTURE_RECTANGLE, GL_RGB,  "default rectangle/rgb" },
++        { GL_TEXTURE_RECTANGLE, GL_RGBA, "fallback rectangle/rgba" },
++        { GL_TEXTURE_2D,        GL_RGB,  "fallback 2d/rgb" },
++        { GL_TEXTURE_2D,        GL_RGBA, "fallback 2d/rgba" },
++    };
+ 
+     TRACE("hdc %p, format %d, largest %u, texture_format %#x, texture_target %#x, max_level %#x, width %d, height %d, drawable %p\n",
+           hdc, format, largest, texture_format, texture_target, max_level, *width, *height, drawable);
+@@ -2238,11 +2530,33 @@ static BOOL macdrv_pbuffer_create(HDC hdc, int format, BOOL largest, GLenum text
+     if (!(gl = opengl_drawable_create(sizeof(*gl), &macdrv_pbuffer_funcs, format, NULL))) return FALSE;
+ 
+     err = CGLCreatePBuffer(*width, *height, texture_target, texture_format, max_level, &gl->pbuffer);
++    if (err != kCGLNoError && (!original_texture_target || !original_texture_format))
++    {
++        for (i = 0; i < ARRAY_SIZE(attempts); i++)
++        {
++            if (attempts[i].target == texture_target && attempts[i].format == texture_format) continue;
++
++            err = CGLCreatePBuffer(*width, *height, attempts[i].target, attempts[i].format, max_level, &gl->pbuffer);
++            if (err == kCGLNoError)
++                break;
++        }
++    }
++
+     if (err != kCGLNoError)
+     {
+-        WARN("CGLCreatePBuffer failed; err %d %s\n", err, CGLErrorString(err));
+-        opengl_drawable_release(&gl->base);
+-        return FALSE;
++        WARN("CGLCreatePBuffer failed; using an offscreen view fallback, err %d %s\n",
++             err, CGLErrorString(err));
++
++        SetRect(&emulated_rect, 0, 0, max(*width, 1), max(*height, 1));
++        if (!(gl->emulated_view = macdrv_create_view(cgrect_from_rect(emulated_rect))))
++        {
++            WARN("failed to create offscreen view fallback\n");
++            opengl_drawable_release(&gl->base);
++            return FALSE;
++        }
++
++        gl->emulated_rect = emulated_rect;
++        gl->emulated_pbuffer = TRUE;
+     }
+ 
+     *drawable = &gl->base;
+@@ -2256,7 +2570,8 @@ static void macdrv_pbuffer_destroy(struct opengl_drawable *base)
+ 
+     TRACE("drawable %s\n", debugstr_opengl_drawable(base));
+ 
+-    CGLReleasePBuffer(gl->pbuffer);
++    if (gl->emulated_view) macdrv_dispose_view(gl->emulated_view);
++    if (gl->pbuffer) CGLReleasePBuffer(gl->pbuffer);
+ }
+ 
+ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl_drawable *read_base, void *private)
+@@ -2276,6 +2591,10 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
+     context->read_hwnd = context->draw_hwnd = NULL;
+     context->read_view = context->draw_view = NULL;
+     context->read_pbuffer = context->draw_pbuffer = NULL;
++    context->read_emulated_pbuffer = context->draw_emulated_pbuffer = FALSE;
++    context->emulated_pbuffer_source = GL_NONE;
++    SetRectEmpty(&context->draw_view_rect);
++    SetRectEmpty(&context->read_view_rect);
+ 
+     if (draw->base.client)
+     {
+@@ -2283,6 +2602,12 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
+         context->draw_hwnd = draw->base.client->hwnd;
+         context->draw_view = client->cocoa_view;
+     }
++    else if (draw->emulated_pbuffer)
++    {
++        context->draw_view = draw->emulated_view;
++        context->draw_view_rect = draw->emulated_rect;
++        context->draw_emulated_pbuffer = TRUE;
++    }
+     else
+     {
+         context->draw_pbuffer = draw->pbuffer;
+@@ -2296,6 +2621,12 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
+             context->read_hwnd = read->base.client->hwnd;
+             context->read_view = client->cocoa_view;
+         }
++        else if (read->emulated_pbuffer)
++        {
++            context->read_view = read->emulated_view;
++            context->read_view_rect = read->emulated_rect;
++            context->read_emulated_pbuffer = TRUE;
++        }
+         else
+         {
+             context->read_pbuffer = read->pbuffer;
+@@ -2582,6 +2913,9 @@ static void macdrv_init_extensions(struct opengl_funcs *funcs, BOOLEAN extension
+     funcs->p_wglQueryCurrentRendererStringWINE = macdrv_wglQueryCurrentRendererStringWINE;
+     funcs->p_wglQueryRendererIntegerWINE = macdrv_wglQueryRendererIntegerWINE;
+     funcs->p_wglQueryRendererStringWINE = macdrv_wglQueryRendererStringWINE;
++
++    funcs->p_glCopyTexImage2D = macdrv_glCopyTexImage2D;
++    funcs->p_glCopyTexSubImage2D = macdrv_glCopyTexSubImage2D;
+ }
+ 
+ /**********************************************************************
+@@ -2613,9 +2947,17 @@ UINT macdrv_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, co
+             goto failed; \
+         }
+     LOAD_FUNCPTR(glCopyPixels);
++    LOAD_FUNCPTR(glCopyTexImage2D);
++    LOAD_FUNCPTR(glCopyTexSubImage2D);
++    LOAD_FUNCPTR(glGetBooleanv);
+     LOAD_FUNCPTR(glGetIntegerv);
+     LOAD_FUNCPTR(glGetString);
+     LOAD_FUNCPTR(glReadPixels);
++    LOAD_FUNCPTR(glScissor);
++    LOAD_FUNCPTR(glTexImage2D);
++    LOAD_FUNCPTR(glTexSubImage2D);
++    LOAD_FUNCPTR(glPixelStorei);
++    LOAD_FUNCPTR(glViewport);
+     LOAD_FUNCPTR(glCopyColorTable);
+ 
+     if (!init_gl_info())
+@@ -2736,6 +3078,8 @@ static BOOL macdrv_context_destroy(void *private)
+ static void *macdrv_get_proc_address(const char *name)
+ {
+     /* redirect some standard OpenGL functions */
++    if (!strcmp(name, "glCopyTexImage2D")) return macdrv_glCopyTexImage2D;
++    if (!strcmp(name, "glCopyTexSubImage2D")) return macdrv_glCopyTexSubImage2D;
+     if (!strcmp(name, "glCopyPixels")) return macdrv_glCopyPixels;
+     if (!strcmp(name, "glGetString")) return macdrv_glGetString;
+     if (!strcmp(name, "glReadPixels")) return macdrv_glReadPixels;
+-- 
+2.53.0
