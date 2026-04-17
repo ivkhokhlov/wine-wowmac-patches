@@ -1,0 +1,95 @@
+name: Bug Report
+description: Report a rendering, build, or launch problem with the published patch series.
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for real reproduction reports against the published patch series.
+        Please compare against the slower non-OpenGL baseline when possible.
+  - type: input
+    id: summary
+    attributes:
+      label: Short summary
+      placeholder: Indoor minimap stays black on MacBook Pro M2 Max
+    validations:
+      required: true
+  - type: input
+    id: mac_model
+    attributes:
+      label: Mac model / SoC
+      placeholder: MacBookPro18,1 / Apple M1 Pro
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: 26.3.1
+    validations:
+      required: true
+  - type: input
+    id: wine_base
+    attributes:
+      label: Wine base commit
+      placeholder: ada7c06102789033fec9ed9bc07e9a863afd8480
+    validations:
+      required: true
+  - type: input
+    id: wow_build
+    attributes:
+      label: WoW build
+      placeholder: 3.3.5a build 12340
+    validations:
+      required: true
+  - type: input
+    id: launcher
+    attributes:
+      label: Launcher or command used
+      placeholder: run-wow-client-smooth-fast-patched-minimal-debug.sh
+    validations:
+      required: true
+  - type: dropdown
+    id: baseline
+    attributes:
+      label: Does the slower non-OpenGL baseline render correctly?
+      options:
+        - "Yes"
+        - "No"
+        - "Not tested"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start the patched fast OpenGL launcher
+        2. Enter an indoor area
+        3. Observe the minimap
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened
+      placeholder: Black minimap, colored stripes, white screen, crash, build failure, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      placeholder: Indoor minimap should match the slower non-OpenGL baseline.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, and extra context
+      description: Attach log files, screenshots, and exact file paths if available.
+      placeholder: Paste paths or links here.
+    validations:
+      required: false

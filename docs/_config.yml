@@ -1,0 +1,6 @@
+title: wine-wowmac-patches
+description: Canonical guide for the WoW 3.3.5a indoor minimap fix on Apple Silicon macOS.
+theme: minima
+baseurl: /wine-wowmac-patches
+url: https://ivkhokhlov.github.io
+markdown: kramdown

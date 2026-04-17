@@ -1,0 +1,5 @@
+9552dabdcdedc77cb6bf7bdb92098153ddc12583a550b57bbc06f0eba17d3fa9  patches/0001-winemac-fall-back-to-offscreen-views-for-pbuffers.patch
+08e290e01d5c550aaa83b1a47aee28212be6b295aaa4628834d141be19bda62e  patches/0002-winemac-attach-detached-OpenGL-views-immediately.patch
+a0706f3e8a20965693f38deec192451f6ebefb939209d0084fef48b486691860  tools/run-wow-client-smooth-fast-patched-minimal-debug.sh
+7a37c5dbe2b9a6d1c4271c14a6982067c59825ddb2cba45bb4cb9b4a04b76170  docs/assets/social-preview.png
+6a8a4eb9adf10e962bd537d12041ac03bf6ea37a19d1df8a3e02a10b70fd14a0  releases/v0.1.0/RELEASE_NOTES.md

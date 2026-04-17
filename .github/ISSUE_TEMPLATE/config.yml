@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Quickstart Guide
+    url: https://github.com/ivkhokhlov/wine-wowmac-patches/blob/main/INSTALL.md
+    about: Start here for the end-to-end setup flow.
+  - name: Technical Notes
+    url: https://github.com/ivkhokhlov/wine-wowmac-patches/blob/main/TECHNICAL_NOTES.md
+    about: Read the root-cause summary before filing a low-level rendering issue.
