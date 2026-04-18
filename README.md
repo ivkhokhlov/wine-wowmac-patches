@@ -62,6 +62,9 @@ WOW_FORCE_STOP=1 ~/wowmac/bin/stop-wow-client.sh
 
 This keeps a small `+wgl` log but avoids the huge trace volume and framebuffer
 dump spam from the heavier debug launcher.
+By default it writes runtime output to the log file without mirroring the full
+stream back to the terminal. Set `WOW_LOG_TO_CONSOLE=1` if you explicitly want
+console mirroring while testing.
 
 ## Repository Layout
 
